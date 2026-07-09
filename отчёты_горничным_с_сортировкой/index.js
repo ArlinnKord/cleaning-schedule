@@ -291,10 +291,19 @@ async function main() {
   const wb = new ExcelJS.Workbook();
 
   // ---- ЛИСТ 1: Уборки на сегодня ----
-  const ws1 = wb.addWorksheet('Уборки на сегодня', { views: [{ state: 'frozen', ySplit: 1 }] });
+  const ws1 = wb.addWorksheet('Уборки на сегодня', { views: [{ state: 'frozen', ySplit: 3 }] });
   ws1.columns = [
     { width: 8 }, { width: 10 }, { width: 14 }, { width: 10 }, { width: 10 }, { width: 40 }, { width: 12 },
   ];
+
+  // Заголовок (строчки 1-2 объединены)
+  ws1.addRow(['']); // строка 1
+  ws1.addRow(['']); // строка 2
+  ws1.mergeCells(1, 1, 2, 7);
+  const titleCell = ws1.getCell(1, 1);
+  titleCell.value = `${DD}.${MM}.${YY}`;
+  titleCell.font = { size: 25, bold: true };
+  titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
 
   const hRow1 = ws1.addRow(['Номер', '10 минут', 'Выезд/Заезд', 'Выезд', '20 минут', 'Комментарий', 'Кол-во чел']);
   hRow1.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF34495E' } };
@@ -370,10 +379,20 @@ async function main() {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const numHK = await new Promise(resolve => {
     rl.question(`Сколько горничных? (по умолчанию 3): `, answer => {
-      rl.close();
       resolve(parseInt(answer) || 3);
     });
   });
+
+  const hkNames = [];
+  for (let i = 0; i < numHK; i++) {
+    const name = await new Promise(resolve => {
+      rl.question(`Имя горничной ${i + 1}: `, answer => {
+        resolve(answer.trim() || `Горничная ${i + 1}`);
+      });
+    });
+    hkNames.push(name);
+  }
+  rl.close();
 
   // Инициализация горничных
   const hkTasks = Array.from({ length: numHK }, () => []);
@@ -615,8 +634,8 @@ async function main() {
   // Какая колонка отвечает за какой тип уборки (1-based)
   const typeToCol = { '10': 2, '40 выезд/заезд': 3, '40 выезд': 4, '20': 5 };
 
-  // Красим только ячейку с минутами (начиная с row 2 = первая строка данных)
-  for (let r = 2; r <= ws1.rowCount; r++) {
+  // Красим только ячейку с минутами (данные начинаются с row 4)
+  for (let r = 4; r <= ws1.rowCount; r++) {
     const room = ws1.getCell(r, 1).value;
     if (room && roomInfo[room]) {
       const { hkIdx, type } = roomInfo[room];
@@ -662,8 +681,17 @@ async function main() {
   const hkSheetNames = ['Горничная 1', 'Горничная 2', 'Горничная 3', 'Горничная 4'];
 
   for (let hk = 0; hk < numHK; hk++) {
-    const wsHk = wb.addWorksheet(hkSheetNames[hk], { views: [{ state: 'frozen', ySplit: 1 }] });
+    const wsHk = wb.addWorksheet(hkNames[hk], { views: [{ state: 'frozen', ySplit: 3 }] });
     wsHk.columns = ws1.columns.map(c => ({ width: c.width }));
+
+    // Заголовок с датой и именем
+    wsHk.addRow(['']);
+    wsHk.addRow(['']);
+    wsHk.mergeCells(1, 1, 2, 7);
+    const hkTitle = wsHk.getCell(1, 1);
+    hkTitle.value = `${DD}.${MM}.${YY} — ${hkNames[hk]}`;
+    hkTitle.font = { size: 25, bold: true };
+    hkTitle.alignment = { horizontal: 'center', vertical: 'middle' };
 
     const hRow = wsHk.addRow(['Номер', '10 минут', 'Выезд/Заезд', 'Выезд', '20 минут', 'Комментарий', 'Кол-во чел']);
     hRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF34495E' } };
