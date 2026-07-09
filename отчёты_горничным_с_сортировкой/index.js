@@ -552,6 +552,10 @@ async function main() {
         const newDiff = Math.abs(newRich - newPoor);
 
         if (newDiff < diff) {
+          // Не ломаем счёт сороковок — только 20↔20, 20↔10, 10↔10
+          const rIs40 = (rTask._cleaning.type === '40 выезд' || rTask._cleaning.type === '40 выезд/заезд');
+          const pIs40 = (pTask._cleaning.type === '40 выезд' || pTask._cleaning.type === '40 выезд/заезд');
+          if (rIs40 !== pIs40) continue;
           const roomDist = Math.abs(rTask.room - pTask.room);
           if (roomDist < bestRoomDist) {
             bestRoomDist = roomDist;
@@ -570,7 +574,26 @@ async function main() {
       hkTasks[minIdx][pi] = richTask;
       hkMins[maxIdx] = hkMins[maxIdx] - (richTask._cleaning.minutes || 0) + (poorTask._cleaning.minutes || 0);
       hkMins[minIdx] = hkMins[minIdx] - (poorTask._cleaning.minutes || 0) + (richTask._cleaning.minutes || 0);
-    } else break;
+    } else {
+      // Обмен не нашёлся — пробуем перенести одну задачу (не сороковку)
+      let bestMoveIdx = -1;
+      let bestMoveDist = Infinity;
+      for (let ri = 0; ri < hkTasks[maxIdx].length; ri++) {
+        const t = hkTasks[maxIdx][ri];
+        const tMin = t._cleaning.minutes || 0;
+        if (tMin > diff) continue;
+        const is40 = (t._cleaning.type === '40 выезд' || t._cleaning.type === '40 выезд/заезд');
+        if (is40) continue;
+        const dist = Math.min(...hkTasks[minIdx].map(pt => Math.abs(t.room - pt.room)));
+        if (dist < bestMoveDist) { bestMoveDist = dist; bestMoveIdx = ri; }
+      }
+      if (bestMoveIdx !== -1 && bestMoveDist < 50) {
+        const task = hkTasks[maxIdx].splice(bestMoveIdx, 1)[0];
+        hkTasks[minIdx].push(task);
+        hkMins[maxIdx] -= task._cleaning.minutes || 0;
+        hkMins[minIdx] += task._cleaning.minutes || 0;
+      } else break;
+    }
   }
 
   // Проверка макс 2 выезд/заезд на горничную — при необходимости меняем
