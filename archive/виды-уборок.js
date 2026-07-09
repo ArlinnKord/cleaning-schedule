@@ -13,11 +13,7 @@ function fixEncoding(str) {
 // ==============================
 // АВТООПРЕДЕЛЕНИЕ ДАТЫ И ФАЙЛА
 // ==============================
-const TODAY = new Date();
-const DD = String(TODAY.getDate()).padStart(2, '0');
-const MM = String(TODAY.getMonth() + 1).padStart(2, '0');
-const YY = String(TODAY.getFullYear()).slice(2);
-const REPORT_DATE = TODAY;
+const STANDARD_CHECKOUT_HOUR = 12;
 
 const DATA_DIR = path.join(__dirname, 'отчёты_из_эдельвейса');
 const OUT_DIR = path.join(__dirname, 'готовые_отчёты_уборка');
@@ -25,20 +21,41 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
 
 function findInputFile() {
-  const exact = path.join(DATA_DIR, `${DD}.${MM}.xls`);
+  const todayDD = String(new Date().getDate()).padStart(2, '0');
+  const todayMM = String(new Date().getMonth() + 1).padStart(2, '0');
+  const exact = path.join(DATA_DIR, `${todayDD}.${todayMM}.xls`);
   if (fs.existsSync(exact)) return exact;
   const files = fs.readdirSync(DATA_DIR).filter(f => f.endsWith('.xls') && !f.includes('~$'));
   if (files.length > 0) return path.join(DATA_DIR, files[0]);
-  console.error(`❌ Файл ${DD}.${MM}.xls не найден в папке отчёты_из_эдельвейса`);
+  console.error(`❌ Файл ${todayDD}.${todayMM}.xls не найден в папке отчёты_из_эдельвейса`);
   process.exit(1);
 }
 
+/** Извлечь дату из имени файла (04.07.xls → { dd: '04', mm: '07' }) */
+function parseDateFromFilename(filePath) {
+  const name = path.basename(filePath);
+  const m = name.match(/^(\d{2})\.(\d{2})\.xls/);
+  if (m) return { dd: m[1], mm: m[2] };
+  // если имя не matches — используем сегодня
+  const d = new Date();
+  return {
+    dd: String(d.getDate()).padStart(2, '0'),
+    mm: String(d.getMonth() + 1).padStart(2, '0'),
+  };
+}
+
 const INPUT_FILE = findInputFile();
+const { dd: DD, mm: MM } = parseDateFromFilename(INPUT_FILE);
+
+const CURRENT_YEAR = new Date().getFullYear();
+const REPORT_DATE = new Date(CURRENT_YEAR, parseInt(MM) - 1, parseInt(DD));
+const YY = String(CURRENT_YEAR).slice(2);
+
 let ver = 1;
 while (fs.existsSync(path.join(OUT_DIR, `виды-уборок-${DD}.${MM}.${YY}-v${ver}.xlsx`))) ver++;
 const OUTPUT_FILE = path.join(OUT_DIR, `виды-уборок-${DD}.${MM}.${YY}-v${ver}.xlsx`);
 
-console.log(`📅 ${DD}.${MM}.${TODAY.getFullYear()}`);
+console.log(`📅 ${DD}.${MM}.${REPORT_DATE.getFullYear()}`);
 console.log(`📥 ${path.basename(INPUT_FILE)} → 📤 ${path.basename(OUTPUT_FILE)}`);
 
 // ==============================
@@ -46,11 +63,13 @@ console.log(`📥 ${path.basename(INPUT_FILE)} → 📤 ${path.basename(OUTPUT_F
 // ==============================
 
 function parseDateRange(rangeStr) {
-  const m = String(rangeStr || '').match(/(\d{2})\.(\d{2})\s*\(.*?\)\s*-\s*(\d{2})\.(\d{2})/);
-  if (!m) return { checkin: null, checkout: null };
+  const m = String(rangeStr || '').match(/(\d{2})\.(\d{2})\s*\((\d{2}):(\d{2})\)\s*-\s*(\d{2})\.(\d{2})\s*\((\d{2}):(\d{2})\)/);
+  if (!m) return { checkin: null, checkout: null, checkoutHour: null, checkoutMinute: null };
   return {
-    checkin: new Date(TODAY.getFullYear(), parseInt(m[2]) - 1, parseInt(m[1])),
-    checkout: new Date(TODAY.getFullYear(), parseInt(m[4]) - 1, parseInt(m[3])),
+    checkin: new Date(CURRENT_YEAR, parseInt(m[2]) - 1, parseInt(m[1])),
+    checkout: new Date(CURRENT_YEAR, parseInt(m[6]) - 1, parseInt(m[5])),
+    checkoutHour: parseInt(m[7]),
+    checkoutMinute: parseInt(m[8]),
   };
 }
 
@@ -86,6 +105,8 @@ function parseEdelweiss(filePath) {
       adults: parseInt(rawRow[10]) || 0,
       checkin: range.checkin,
       checkout: range.checkout,
+      checkoutHour: range.checkoutHour,
+      checkoutMinute: range.checkoutMinute,
       status,
     });
   }
@@ -98,7 +119,7 @@ function parseEdelweiss(filePath) {
 // ==============================
 
 function getArea(room) {
-  if (room >= 112 && room <= 116) return 3;
+  if (room >= 112 && room <= 116) return 1.5;
   return Math.floor(room / 100);
 }
 
@@ -114,6 +135,16 @@ function getCleaning(room, sections) {
   if (staying.length > 0) return { type: '20', minutes: 20 };
 
   return { type: null, minutes: 0 };
+}
+
+function getLateCheckoutStr(entry) {
+  if (!entry || entry.checkoutHour == null) return '';
+  if (entry.checkoutHour > STANDARD_CHECKOUT_HOUR) {
+    const h = String(entry.checkoutHour).padStart(2, '0');
+    const m = String(entry.checkoutMinute).padStart(2, '0');
+    return `поздний выезд до ${h}:${m}`;
+  }
+  return '';
 }
 
 function makeComment(room, sections, cleaningType) {
@@ -135,12 +166,19 @@ function makeComment(room, sections, cleaningType) {
 
     let comment = parts.join(' + ');
     if (notes.includes('шампанск')) comment += '; шампанское (др)';
+
+    // для выезд/заезд — добавить информацию о позднем выезде
+    if (cleaningType.type === '40 выезд/заезд') {
+      const dep = sections.departures.find(r => r.room === room);
+      const lateStr = getLateCheckoutStr(dep);
+      if (lateStr) comment += `; ${lateStr}`;
+    }
+
     return comment;
   }
 
   if (cleaningType.type === '40 выезд') {
-    const dep = sections.departures.find(r => r.room === room);
-    return dep ? `Выезд — ${dep.guest}` : '';
+    return '';
   }
 
   if (cleaningType.type === '20') {
@@ -148,7 +186,7 @@ function makeComment(room, sections, cleaningType) {
     if (!entry) return '';
     const nightsStayed = Math.round((REPORT_DATE - entry.checkin) / (1000 * 60 * 60 * 24));
     const remaining = entry.nights - nightsStayed;
-    if (nightsStayed >= 2 && remaining >= 2 && nightsStayed < 7) return 'смена белья';
+    if (nightsStayed >= 2 && nightsStayed % 2 === 0 && remaining >= 2) return 'смена белья';
     return '';
   }
 

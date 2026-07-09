@@ -34,12 +34,14 @@ function findInputFile() {
 }
 
 const INPUT_FILE = findInputFile();
-const OUTPUT_FILE = path.join(OUT_DIR, `график-уборок-${DD}.${MM}.${YY}.xlsx`);
+let ver = 1;
+while (fs.existsSync(path.join(OUT_DIR, `график-уборок-${DD}.${MM}.${YY}-v${ver}.xlsx`))) ver++;
+const OUTPUT_FILE = path.join(OUT_DIR, `график-уборок-${DD}.${MM}.${YY}-v${ver}.xlsx`);
 
 const todayStr = `${DD}.${MM}.${TODAY.getFullYear()}`;
 
 console.log(`📅 ${DD}.${MM}.${TODAY.getFullYear()}`);
-console.log(`📥 ${path.basename(INPUT_FILE)} → 📤 график-уборок-${DD}.${MM}.${YY}.xlsx`);
+console.log(`📥 ${path.basename(INPUT_FILE)} → 📤 ${path.basename(OUTPUT_FILE)}`);
 
 const MAID_COLORS = [
   { name: 'Горничная 1', fill: 'E74C3C' },  // Красный
@@ -224,53 +226,83 @@ function getGuestCount(room, sections) {
 // РАСПРЕДЕЛЕНИЕ
 // ==============================
 
+function getArea(room) {
+  if (room >= 112 && room <= 116) return 98;
+  return Math.floor(room / 100);
+}
+
 function distribute(tasks) {
   const activeTasks = tasks.filter(t => t._cleaning && t._cleaning.type);
-  // Сортируем по порядку: зона + номер комнаты
-  function getArea(room) {
-    if (room >= 112 && room <= 116) return 98;
-    return Math.floor(room / 100);
-  }
-  // Сортируем по номеру комнаты (это группирует по этажам и корпусам)
-  activeTasks.sort((a, b) => a.room - b.room);
-
-  const totalMin = activeTasks.reduce((s, t) => s + t._cleaning.minutes, 0);
-  const ideal = totalMin / MAID_COLORS.length; // ~200
-
   const maids = MAID_COLORS.map(m => ({ ...m, tasks: [], total: 0 }));
 
-  for (const task of activeTasks) {
-    const area = getArea(task.room);
-    const isCheckout = task._cleaning.type === '40 выезд/заезд';
-    const taskMin = task._cleaning.minutes;
-
-    // Отсеиваем по лимиту выезд/заезд (но не всех — хотя бы одна должна остаться)
-    let valid = maids.filter(m => {
-      const cnt = m.tasks.filter(t => t._cleaning.type === '40 выезд/заезд').length;
-      return cnt + (isCheckout ? 1 : 0) <= 2;
-    });
-    if (valid.length === 0) valid = maids; // все набрали лимит — снимаем ограничение
-
-    // Сортируем valid по дефициту от идеала
-    const withDeficit = valid.map(m => ({
-      maid: m,
-      deficit: ideal - m.total,
-      onFloor: m.tasks.some(t => getArea(t.room) === area),
-    }));
-
-    // Сначала пытаемся отдать той, кто уже на этаже и у кого дефицит > 0
-    let candidates = withDeficit.filter(w => w.onFloor && w.deficit > 0);
-    if (candidates.length === 0) {
-      candidates = withDeficit.sort((a, b) => b.deficit - a.deficit);
-    } else {
-      candidates.sort((a, b) => b.deficit - a.deficit);
-    }
-
-    const best = candidates[0].maid;
-    best.tasks.push(task);
-    best.total += taskMin;
+  // Группируем задачи по зонам
+  const byArea = {};
+  for (const t of activeTasks) {
+    const a = getArea(t.room);
+    if (!byArea[a]) byArea[a] = [];
+    byArea[a].push(t);
   }
 
+  // Зоны от большей к меньшей
+  const areas = Object.entries(byArea)
+    .map(([a, ts]) => ({ area: parseInt(a), tasks: ts, total: ts.reduce((s, t) => s + t._cleaning.minutes, 0) }))
+    .sort((a, b) => b.total - a.total);
+
+  const idealPerMaid = activeTasks.reduce((s, t) => s + t._cleaning.minutes, 0) / maids.length;
+
+  for (const grp of areas) {
+    const { tasks: areaTasks, total: areaTotal } = grp;
+    const onFloor = maids.filter(m => m.tasks.some(t => getArea(t.room) === grp.area));
+    const chosen = onFloor.length > 0
+      ? onFloor.sort((a, b) => a.total - b.total)[0]
+      : maids.sort((a, b) => a.total - b.total)[0];
+
+    // Если зона большая (>1.3 идеала) — подключаем второго
+    let secondChosen = null;
+    if (areaTotal > idealPerMaid * 1.3) {
+      secondChosen = maids.filter(m => m !== chosen).sort((a, b) => a.total - b.total)[0];
+    }
+
+    for (const task of areaTasks) {
+      const type = task._cleaning.type;
+      let pickMaid = chosen;
+      if (secondChosen) {
+        const cType = chosen.tasks.filter(t => t._cleaning.type === type).length;
+        const sType = secondChosen.tasks.filter(t => t._cleaning.type === type).length;
+        if (chosen.total > secondChosen.total + 40) pickMaid = secondChosen;
+        else if (cType > sType + 1) pickMaid = secondChosen;
+        else if (chosen.total > idealPerMaid && cType >= sType) pickMaid = secondChosen;
+        else if (cType >= 3) pickMaid = secondChosen;
+      }
+      pickMaid.tasks.push(task);
+      pickMaid.total += task._cleaning.minutes;
+    }
+  }
+
+  // Балансировка
+  for (let iter = 0; iter < 5; iter++) {
+    const sorted = [...maids].sort((a, b) => b.total - a.total);
+    const heavy = sorted[0], light = sorted[sorted.length - 1];
+    if (heavy.total - light.total <= 20) break;
+    let best = null, bestScore = Infinity;
+    for (let i = 0; i < heavy.tasks.length; i++) {
+      const task = heavy.tasks[i], type = task._cleaning.type;
+      if (light.tasks.filter(t => t._cleaning.type === type).length >=
+          heavy.tasks.filter(t => t._cleaning.type === type).length) continue;
+      const nd = Math.abs((heavy.total - task._cleaning.minutes) - (light.total + task._cleaning.minutes));
+      const sameArea = light.tasks.some(t => getArea(t.room) === getArea(task.room));
+      if (nd + (sameArea ? 0 : 30) < bestScore) {
+        bestScore = nd + (sameArea ? 0 : 30);
+        best = { idx: i, task };
+      }
+    }
+    if (best) {
+      heavy.tasks.splice(best.idx, 1);
+      light.tasks.push(best.task);
+      heavy.total -= best.task._cleaning.minutes;
+      light.total += best.task._cleaning.minutes;
+    } else break;
+  }
   return maids;
 }
 
