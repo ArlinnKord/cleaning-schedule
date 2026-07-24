@@ -703,6 +703,52 @@ async function main() {
     legendRow.getCell(1).font = { bold: true, color: { argb: 'FF000000' }, size: 10 };
   }
 
+  // --- Расходники (расчёт по горничным) ---
+  console.log('\n=== РАСХОДНИКИ ===');
+
+  const hkConsumables = new Array(numHK).fill(0).map(() => ({ base: 0, extra: 0 }));
+
+  for (let i = 0; i < numHK; i++) {
+    for (const t of hkTasks[i]) {
+      const type = t._cleaning.type;
+      // Стандарт: +2 каждого вида на выезд (готовится на 2 человек)
+      if (type === '40 выезд' || type === '40 выезд/заезд') {
+        hkConsumables[i].base += 2;
+      }
+      // Дополнительно: если заезд с гостями >2 — разница
+      if (type === '10' || type === '40 выезд/заезд') {
+        const gc = t._guestCount;
+        if (gc) {
+          const total = String(gc).split('+').reduce((sum, p) => sum + (parseInt(p) || 0), 0);
+          if (total > 2) {
+            hkConsumables[i].extra += (total - 2);
+          }
+        }
+      }
+    }
+    const c = hkConsumables[i];
+    c.total = c.base + c.extra;
+    console.log(`${hkNames[i]}: по ${c.total} шт каждого вида (${c.base} — выезды ×2, +${c.extra} — доп. гости)`);
+  }
+
+  // Строка с расходниками в Excel
+  ws1.addRow([]);
+  ws1.addRow(['Расходники (наборов на номер):']);
+  ws1.getCell(ws1.rowCount, 1).font = { bold: true, size: 11 };
+
+  for (let i = 0; i < numHK; i++) {
+    const c = hkConsumables[i];
+    const row = ws1.addRow([
+      `${hkNames[i]}: по ${c.total} шт каждого вида (выезды ×2: ${c.base}, доп. гости: +${c.extra})`
+    ]);
+    row.getCell(1).fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: HK_COLORS[i % HK_COLORS.length] },
+    };
+    row.getCell(1).font = { bold: true, color: { argb: 'FF000000' }, size: 10 };
+  }
+
   // --- Индивидуальные листы для каждой горничной (все строки, но цвет только её) ---
   const hkSheetNames = ['Горничная 1', 'Горничная 2', 'Горничная 3', 'Горничная 4'];
 
