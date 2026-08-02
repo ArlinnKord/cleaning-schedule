@@ -14,26 +14,39 @@ if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
 // ПОИСК ФАЙЛОВ
 // ==============================
 
-function findReportFile(prefix) {
+function findFile(prefix) {
   const files = fs.readdirSync(DATA_DIR)
     .filter(f => f.startsWith(prefix) && f.endsWith('.xlsx') && !f.includes('~$'))
     .sort()
     .reverse();
-  if (files.length === 0) {
-    console.error(`❌ Файл ${prefix}...xlsx не найден в папке отчёты_из_travelline`);
-    process.exit(1);
-  }
+  if (files.length === 0) return null;
   return path.join(DATA_DIR, files[0]);
 }
 
-const ARRIVALS_FILE = findReportFile('ArrivalsReport');
-const DEPARTURES_FILE = findReportFile('DeparturesReport');
-const OCCUPIED_FILE = findReportFile('OccupiedRoomTypes');
+function findReport(prefixes) {
+  for (const p of prefixes) {
+    const f = findFile(p);
+    if (f) return f;
+  }
+  return null;
+}
+
+// Основной источник: русскоязычные отчёты «Заезды», «Выезды», «Проживания»
+// (fallback — англоязычные ArrivalsReport / DeparturesReport / OccupiedRoomTypes)
+const ARRIVALS_FILE = findReport(['Заезды', 'ArrivalsReport']);
+const DEPARTURES_FILE = findReport(['Выезды', 'DeparturesReport']);
+const STAYING_FILE = findReport(['Проживания', 'OccupiedRoomTypes']);
+
+if (!ARRIVALS_FILE || !DEPARTURES_FILE || !STAYING_FILE) {
+  console.error('❌ Не найдены отчёты Заезды/Выезды/Проживания в папке отчёты_из_travelline');
+  process.exit(1);
+}
 
 console.log(`📥 Заезды: ${path.basename(ARRIVALS_FILE)}`);
 console.log(`📥 Выезды: ${path.basename(DEPARTURES_FILE)}`);
-console.log(`📥 Занятые: ${path.basename(OCCUPIED_FILE)}`);
+console.log(`📥 Проживания: ${path.basename(STAYING_FILE)}`);
 
+// Дата из имени файла заездов (Заезды_01.08.2026_01.08.2026.xlsx)
 const dateMatch = path.basename(ARRIVALS_FILE).match(/(\d{2})\.(\d{2})\.(\d{4})/);
 const DD = dateMatch ? dateMatch[1] : String(new Date().getDate()).padStart(2, '0');
 const MM = dateMatch ? dateMatch[2] : String(new Date().getMonth() + 1).padStart(2, '0');
@@ -66,111 +79,135 @@ function parseTLDate(str) {
 }
 
 // ==============================
-// ПАРСИНГ ОТЧЁТОВ
+// ПАРСИНГ ОТЧЁТОВ TRAVELLINE (ЗАЕЗДЫ / ВЫЕЗДЫ / ПРОЖИВАНИЯ)
 // ==============================
 
-function readSheet(filePath) {
+function fmtDateStr(d) {
+  return `${String(d.getDate()).padStart(2,'0')}.${String(d.getMonth()+1).padStart(2,'0')}.${d.getFullYear()}`;
+}
+
+function colIndex(header, names) {
+  for (const n of names) {
+    const i = header.indexOf(n);
+    if (i !== -1) return i;
+  }
+  return -1;
+}
+
+/**
+ * Читает один отчёт Travelline (Заезды/Выезды/Проживания или англ. аналог)
+ * и возвращает записи по комнатам.
+ * section: 'arrivals' | 'departures' | 'staying'
+ */
+function parseTLReport(filePath, todayDate, section) {
   const wb = XLSX.readFile(filePath);
-  const ws = wb.Sheets['Report'];
+  const ws = wb.Sheets['Report'] || wb.Sheets[wb.SheetNames[0]];
   const data = XLSX.utils.sheet_to_json(ws, { defval: '', header: 1 });
+  if (data.length < 2) return [];
 
-  // найдём заголовок по № комнаты
-  const headerRow = data[0];
-  const roomCol = headerRow ? headerRow.indexOf('№ комнаты') : -1;
-  if (roomCol === -1) {
-    console.error(`❌ Колонка "№ комнаты" не найдена в ${path.basename(filePath)}`);
-    process.exit(1);
-  }
+  const h = data[0];
+  const roomCol = colIndex(h, ['Номер комнаты', '№ комнаты']);
+  const guestCol = colIndex(h, ['ФИО гостей', 'ФИО кириллицей', 'Гость', 'ФИО']);
+  const countCol = colIndex(h, ['Количество гостей']);
+  const commentCol = colIndex(h, ['Комментарий гостя']);
+  const notesCol = colIndex(h, ['Заметки']);
+  const nightsCol = colIndex(h, ['Количество ночей']);
+  const checkinCol = colIndex(h, ['Время заезда', 'Заезд']);
+  const checkoutCol = colIndex(h, ['Время выезда', 'Выезд']);
+  const periodCol = colIndex(h, ['Период проживания']);
+  if (roomCol === -1) return [];
 
-  return { data, roomCol };
-}
+  const todayStr = fmtDateStr(todayDate);
+  const rooms = {};
 
-function parseArrivals(filePath) {
-  const { data, roomCol } = readSheet(filePath);
-  const entries = [];
   for (let i = 1; i < data.length; i++) {
     const row = data[i];
     if (!row || !row[roomCol]) continue;
     const room = parseInt(row[roomCol]);
     if (isNaN(room)) continue;
 
-    const checkin = parseTLDate(row[6]);
-    const checkout = parseTLDate(row[7]);
-    const notes = [String(row[16] || ''), String(row[17] || '')].join(' ').trim();
+    let checkinStr = '', checkoutStr = '';
+    if (periodCol !== -1) {
+      // Проживания: "31.07.2026, 14:04 - 02.08.2026, 12:00"
+      const m = String(row[periodCol] || '').match(/(\d{2}\.\d{2}\.\d{4},\s*\d{1,2}:\d{2})\s*-\s*(\d{2}\.\d{2}\.\d{4},\s*\d{1,2}:\d{2})/);
+      if (m) { checkinStr = m[1]; checkoutStr = m[2]; }
+    }
+    if (section === 'arrivals' && !checkinStr && checkinCol !== -1) checkinStr = String(row[checkinCol] || '');
+    if (section === 'departures' && !checkoutStr && checkoutCol !== -1) checkoutStr = String(row[checkoutCol] || '');
 
-    entries.push({
-      room, guest: String(row[1] || '').replace(/\s*\*+$/, '').trim(),
-      guestCount: parseInt(row[3]) || 0,
-      checkin: checkin.date, checkout: checkout.date,
-      checkoutHour: checkout.hour, checkoutMinute: checkout.minute,
-      notes, status: String(row[11] || ''),
-    });
+    // Фильтр: для заездов/выездов только сегодняшние
+    if (section === 'arrivals' && !checkinStr.startsWith(todayStr)) continue;
+    if (section === 'departures' && !checkoutStr.startsWith(todayStr)) continue;
+
+    if (!rooms[room]) {
+      rooms[room] = {
+        room,
+        guests: [],
+        guestCount: 0,
+        comment: '', notes: '',
+        nights: 0,
+        checkin: null, checkout: null,
+        checkoutHour: null, checkoutMinute: null,
+      };
+    }
+    const rec = rooms[room];
+
+    const guest = String(row[guestCol] || '').trim();
+    if (guest && !rec.guests.includes(guest)) rec.guests.push(guest);
+
+    const cnt = parseInt(row[countCol]);
+    if (!isNaN(cnt)) rec.guestCount += cnt;
+
+    const cm = String(row[commentCol] || '').trim();
+    if (cm) rec.comment = rec.comment ? rec.comment + '; ' + cm : cm;
+
+    const nt = String(row[notesCol] || '').trim();
+    if (nt) rec.notes = rec.notes ? rec.notes + '; ' + nt : nt;
+
+    const nn = parseInt(row[nightsCol]);
+    if (!isNaN(nn)) rec.nights = Math.max(rec.nights, nn);
+
+    const ci = parseTLDate(checkinStr);
+    const co = parseTLDate(checkoutStr);
+    if (ci.date) rec.checkin = ci.date;
+    if (co.date) { rec.checkout = co.date; rec.checkoutHour = co.hour; rec.checkoutMinute = co.minute; }
   }
-  return entries;
-}
 
-function parseDepartures(filePath) {
-  const { data, roomCol } = readSheet(filePath);
-  const entries = [];
-  for (let i = 1; i < data.length; i++) {
-    const row = data[i];
-    if (!row || !row[roomCol]) continue;
-    const room = parseInt(row[roomCol]);
-    if (isNaN(room)) continue;
-
-    const checkin = parseTLDate(row[4]);
-    const checkout = parseTLDate(row[5]);
-    const notes = [String(row[13] || ''), String(row[14] || '')].join(' ').trim();
-
-    entries.push({
-      room, guest: String(row[1] || '').replace(/\s*\*+$/, '').trim(),
-      guestCount: parseInt(row[3]) || 0,
-      checkin: checkin.date, checkout: checkout.date,
-      checkoutHour: checkout.hour, checkoutMinute: checkout.minute,
-      notes, status: String(row[9] || ''),
-    });
-  }
-  return entries;
-}
-
-function parseOccupied(filePath) {
-  const { data, roomCol } = readSheet(filePath);
-  const entries = [];
-  for (let i = 1; i < data.length; i++) {
-    const row = data[i];
-    if (!row || !row[roomCol]) continue;
-    const room = parseInt(row[roomCol]);
-    if (isNaN(room)) continue;
-
-    const checkin = parseTLDate(row[3]);
-    const checkout = parseTLDate(row[4]);
-    const notes = [String(row[12] || ''), String(row[13] || '')].join(' ').trim();
-
-    entries.push({
-      room, guest: String(row[1] || '').replace(/\s*\*+$/, '').trim(),
-      guestCount: parseInt(row[2]) || 0,
-      checkin: checkin.date, checkout: checkout.date,
-      checkoutHour: checkout.hour, checkoutMinute: checkout.minute,
-      notes,
-    });
-  }
-  return entries;
+  return Object.values(rooms).map(r => {
+    let nights = r.nights;
+    if (!nights && r.checkin && r.checkout)
+      nights = Math.round((r.checkout - r.checkin) / (1000 * 60 * 60 * 24));
+    return {
+      room: r.room,
+      guest: r.guests.join(', '),
+      guestCount: r.guestCount,
+      comment: r.comment,
+      notes: r.notes,
+      nights,
+      checkin: r.checkin,
+      checkout: r.checkout,
+      checkoutHour: r.checkoutHour,
+      checkoutMinute: r.checkoutMinute,
+    };
+  });
 }
 
 // ==============================
-// СБОРКА СЕКЦИЙ
+// СБОРКА
 // ==============================
 
-const arrivals = parseArrivals(ARRIVALS_FILE);
-const departures = parseDepartures(DEPARTURES_FILE);
-const staying = parseOccupied(OCCUPIED_FILE);
+const arrivals = parseTLReport(ARRIVALS_FILE, REPORT_DATE, 'arrivals');
+const departures = parseTLReport(DEPARTURES_FILE, REPORT_DATE, 'departures');
+const allStaying = parseTLReport(STAYING_FILE, REPORT_DATE, 'staying');
 
-const sections = { arrivals, departures, staying };
+// Staying = те кто проживает И не выезжает сегодня
+const depRoomSet = new Set(departures.map(d => d.room));
+const staying = allStaying.filter(s => !depRoomSet.has(s.room));
 
 const arrivalRooms = [...new Set(arrivals.map(r => r.room))];
-const depRooms = [...new Set(departures.map(r => r.room))];
+const depRoomsList = [...new Set(departures.map(r => r.room))];
 const stayRooms = [...new Set(staying.map(r => r.room))];
-console.log(`Заезды: ${arrivalRooms.length} номеров, Выезды: ${depRooms.length} номеров, Проживания: ${stayRooms.length} номеров`);
+console.log(`Заезды: ${arrivalRooms.length} номеров, Выезды: ${depRoomsList.length} номеров, Проживания: ${stayRooms.length} номеров`);
 
 // ==============================
 // ОПРЕДЕЛЕНИЕ ТИПОВ УБОРОК
@@ -187,74 +224,120 @@ function getArea(room) {
 }
 
 function getCleaning(room) {
-  const isArrival = sections.arrivals.some(r => r.room === room);
-  const isDeparture = sections.departures.some(r => r.room === room);
+  const isArrival = arrivals.some(r => r.room === room);
+  const isDeparture = departures.some(r => r.room === room);
   if (isArrival && isDeparture) return { type: '40 выезд/заезд', minutes: 40 };
   if (isDeparture) return { type: '40 выезд', minutes: 40 };
   if (isArrival) return { type: '10', minutes: 10 };
-  if (sections.staying.some(r => r.room === room)) return { type: '20', minutes: 20 };
+  if (staying.some(r => r.room === room)) return { type: '20', minutes: 20 };
   return { type: null, minutes: 0 };
 }
 
-function getLateCheckoutStr(entry) {
-  if (!entry || entry.checkoutHour == null) return '';
-  if (entry.checkoutHour > STANDARD_CHECKOUT_HOUR) {
-    return `поздний выезд до ${String(entry.checkoutHour).padStart(2,'0')}:${String(entry.checkoutMinute).padStart(2,'0')}`;
+/** Извлекает количество гостей из текста комментария: "4 чел, 2 взр +2 реб", "2 чел" и т.п. */
+function parseGuestCountFromText(text) {
+  const t = String(text || '').toLowerCase();
+  // "N взр + M реб" / "N взрослых + M детей"
+  const withKids = t.match(/(\d+)\s*(?:взр|взросл\w*)\s*\S{0,4}\s*[+,]\s*(\d+)\s*(?:ребен\w*|реб|дет\w*)/);
+  if (withKids) return parseInt(withKids[1]) + parseInt(withKids[2]);
+  // "N чел" / "N человек" / "N человека"
+  const chel = t.match(/(?:^|[^\d])(\d+)\s*(?:чел|человек\w*)/);
+  if (chel) return parseInt(chel[1]);
+  // "гостей: N"
+  const guestColon = t.match(/гостей[:\s]+(\d+)/);
+  if (guestColon) return parseInt(guestColon[1]);
+  return 0;
+}
+
+function getGuestCount(room) {
+  const entry = arrivals.find(r => r.room === room) || staying.find(r => r.room === room);
+  if (entry) {
+    // Сначала парсим из комментария (в отчёте колонка "Количество гостей" часто = 1)
+    const fromText = parseGuestCountFromText(`${entry.comment} ${entry.notes}`);
+    if (fromText > 0) return String(fromText);
+    if (entry.guestCount > 0) return String(entry.guestCount);
   }
   return '';
 }
 
-function getGuestCount(room) {
-  for (const entry of sections.arrivals)
-    if (entry.room === room && entry.guestCount > 0) return String(entry.guestCount);
-  for (const entry of sections.staying)
-    if (entry.room === room && entry.guestCount > 0) return String(entry.guestCount);
-  return '';
+/**
+ * Извлекает из комментария гостя информацию о кроватях и особых пожеланиях.
+ * Примеры: "Double bed", "2 Single beds", "1 кровать", "2 раздельные кровати",
+ * "доп место", "люлька", "ШАМПАНСКОЕ+ ОТКРЫТКУ"
+ */
+function parseBedComment(text) {
+  const t = String(text || '').toLowerCase();
+  const parts = [];
+
+  // Тип кровати
+  if (/(2\s*single|two\s*single|2\s*раздельн|2\s*отдельн|две\s*односпальн|2\s*кроват|раздельн|отдельн)/.test(t)) {
+    parts.push('2 односпальные');
+  } else if (/(double\s*bed|двуспальн|большая\s*двуспальн)/.test(t)) {
+    parts.push('1 двуспальная');
+  } else if (/(1\s*кроват|одна\s*кроват|one\s*bed|1\s*bed)/.test(t)) {
+    parts.push('1 кровать');
+  } else {
+    parts.push('1 кровать'); // значение по умолчанию
+  }
+
+  if (/люльк/.test(t)) parts.push('люлька');
+  if (/детская\s*кроватк/.test(t)) parts.push('детская кроватка');
+  if (/доп[\s.]*мест|доп\.?\s*место/.test(t)) parts.push('доп. место');
+  if (/диван/.test(t)) parts.push('диван');
+
+  // Особый гость: открытка/шампанское
+  if (/шампанск|открытк|день\s*рожден|блогер|блоггер/i.test(t)) parts.push('открытка/шампанское');
+
+  return parts;
 }
 
 function makeComment(room, cleaningType) {
   if (!cleaningType || !cleaningType.type) return '';
 
+  // Комментарий гостя для этой комнаты (из заездов или проживаний)
+  const entry = arrivals.find(r => r.room === room) || staying.find(r => r.room === room);
+  const guestText = `${entry ? entry.comment : ''} ${entry ? entry.notes : ''}`.trim();
+
   if (cleaningType.type === '10' || cleaningType.type === '40 выезд/заезд') {
-    const entry = sections.arrivals.find(r => r.room === room);
-    if (!entry) return '1 кровать';
-    const notes = entry.notes.toLowerCase();
-    const parts = [];
+    const parts = parseBedComment(guestText);
 
-    if (notes.includes('2 кроват') || notes.includes('2 раздельн') || notes.includes('2 кров')) parts.push('2 кровати');
-    else parts.push('1 кровать');
-
-    if (notes.includes('люльк')) parts.push('люлька');
-    if (notes.includes('детская кроватк')) parts.push('детская кроватка');
-    if (notes.includes('доп место') || notes.includes('доп.')) parts.push('доп. место');
-    if (notes.includes('диван')) parts.push('диван');
-    if (notes.includes('шампанск')) parts.push('шампанское (др)');
-
-    let comment = parts.join(' + ');
+    // Доп. места если гостей больше 2
+    const gc = getGuestCount(room);
+    if (gc) {
+      const total = String(gc).split('+').reduce((sum, p) => sum + (parseInt(p) || 0), 0);
+      if (total > 2 && !parts.some(p => p.includes('доп'))) parts.push('доп. места');
+    }
 
     if (cleaningType.type === '40 выезд/заезд') {
-      const dep = sections.departures.find(r => r.room === room);
-      const lateStr = getLateCheckoutStr(dep);
-      if (lateStr) comment += `; ${lateStr}`;
+      const dep = departures.find(r => r.room === room);
+      if (dep && dep.checkoutHour != null && dep.checkoutHour > STANDARD_CHECKOUT_HOUR) {
+        parts.push(`поздний выезд до ${String(dep.checkoutHour).padStart(2,'0')}:${String(dep.checkoutMinute).padStart(2,'0')}`);
+      }
     }
-    return comment;
+
+    return parts.join('; ');
   }
 
   if (cleaningType.type === '40 выезд') {
-    const dep = sections.departures.find(r => r.room === room);
-    return getLateCheckoutStr(dep);
+    const dep = departures.find(r => r.room === room);
+    if (!dep || dep.checkoutHour == null) return '';
+    if (dep.checkoutHour > STANDARD_CHECKOUT_HOUR) {
+      return `поздний выезд до ${String(dep.checkoutHour).padStart(2,'0')}:${String(dep.checkoutMinute).padStart(2,'0')}`;
+    }
+    return '';
   }
 
   if (cleaningType.type === '20') {
-    const entry = sections.staying.find(r => r.room === room);
-    if (!entry) return '';
-    const nightsStayed = Math.round((REPORT_DATE - entry.checkin) / (1000*60*60*24));
-    let totalNights = 0;
-    if (entry.checkout && entry.checkin)
-      totalNights = Math.round((entry.checkout - entry.checkin) / (1000*60*60*24));
-    const remaining = totalNights - nightsStayed;
-    if (nightsStayed >= 2 && nightsStayed % 2 === 0 && remaining >= 2) return 'смена белья';
-    return '';
+    const entry20 = staying.find(r => r.room === room);
+    const parts = [];
+    if (entry20 && entry20.checkin) {
+      const nightsStayed = Math.round((REPORT_DATE - entry20.checkin) / (1000*60*60*24));
+      const remaining = entry20.nights - nightsStayed;
+      if (nightsStayed >= 2 && nightsStayed % 2 === 0 && remaining >= 2) parts.push('смена белья');
+    }
+    // Особый гость для проживающих
+    const special = parseBedComment(guestText).filter(p => p === 'открытка/шампанское');
+    for (const sp of special) if (!parts.includes(sp)) parts.push(sp);
+    return parts.join('; ');
   }
   return '';
 }
@@ -266,11 +349,25 @@ function makeComment(room, cleaningType) {
 const readline = require('readline');
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
+// Queue-based ask that works with piped input (readline.question() breaks on pipes)
+const _answerQueue = [];
+const _waiters = [];
+rl.on('line', line => {
+  if (_waiters.length) {
+    _waiters.shift()(line);
+  } else {
+    _answerQueue.push(line);
+  }
+});
+
 async function ask(question, def) {
+  process.stdout.write(question);
   return new Promise(resolve => {
-    rl.question(question, answer => {
-      resolve(answer.trim() || def);
-    });
+    if (_answerQueue.length) {
+      resolve(_answerQueue.shift().trim() || def);
+    } else {
+      _waiters.push(line => resolve(line.trim() || def));
+    }
   });
 }
 
@@ -304,8 +401,12 @@ async function main() {
 
   const numHK = parseInt(await ask('Сколько горничных? (по умолчанию 3): ')) || 3;
   const hkNames = [];
+  const hkHours = [];
   for (let i = 0; i < numHK; i++) {
-    hkNames.push(await ask(`Имя горничной ${i + 1}: `) || `Горничная ${i + 1}`);
+    const name = await ask(`Имя горничной ${i + 1}: `) || `Горничная ${i + 1}`;
+    hkNames.push(name);
+    const hours = parseFloat(await ask(`  ${name}: сколько часов работает? (по умолчанию 8): `)) || 8;
+    hkHours.push(hours);
   }
   rl.close();
 
@@ -320,159 +421,310 @@ async function main() {
     if (task._cleaning.type === '40 выезд/заезд') hkVyzdyZaezd[hkIdx]++;
   }
 
-  const allMinutes = tasks.reduce((s, t) => s + (t._cleaning.minutes || 0), 0);
-  const targetPerHK = allMinutes / numHK;
-  console.log(`\n=== РАСПРЕДЕЛЕНИЕ (${numHK} горничных, цель ~${Math.round(targetPerHK)} мин/чел) ===`);
+  const LARGE_ROOMS = new Set([107, 201, 208, 216, 217, 220, 221, 222, 224, 225]);
+  // Светло-бежевая подсветка номера в столбце «Номер» — визуальный индикатор больших номеров, не влияет на распределение
+  const LARGE_ROOM_COLOR = 'FFEFD9B3';
 
-  // Зона 1.5
-  const zone15Tasks = tasks.filter(t => getArea(t.room) === 1.5);
-  let mainTasks = tasks.filter(t => getArea(t.room) !== 1.5).sort((a, b) => a.room - b.room);
-  if (zone15Tasks.length > 0 && numHK > 1) {
-    for (const t of zone15Tasks.sort((a, b) => a.room - b.room)) assignToHK(0, t);
-    console.log(`Зона 1.5 (корпус 112-116): горничная 1 (${hkMins[0]} мин)`);
-  }
-
-  // Сороковки
+  // Все задачи по типам
   const allForties = tasks.filter(t => t._cleaning.type === '40 выезд' || t._cleaning.type === '40 выезд/заезд')
     .sort((a, b) => a.room - b.room);
+  const allTwenties = tasks.filter(t => t._cleaning.type === '20').sort((a, b) => a.room - b.room);
+  const allTens = tasks.filter(t => t._cleaning.type === '10').sort((a, b) => a.room - b.room);
   const totalForties = allForties.length;
-  const base40 = Math.floor(totalForties / numHK);
-  const rem40 = totalForties % numHK;
-  const fortyNeeded = [];
+  const totalTwenties = allTwenties.length;
+  const totalTens = allTens.length;
+  console.log(`40-минутных: ${totalForties}, 20-минутных: ${totalTwenties}, 10-минутных: ${totalTens}`);
+
+  const allMinutes = tasks.reduce((s, t) => s + (t._cleaning.minutes || 0), 0);
+  const totalHours = hkHours.reduce((s, h) => s + h, 0);
+  const targetMins = hkHours.map(h => allMinutes * h / totalHours);
+  console.log(`\n=== РАСПРЕДЕЛЕНИЕ (${numHK} горничных, всего ${allMinutes} мин) ===`);
   for (let i = 0; i < numHK; i++) {
-    const existing = hkTasks[i].filter(t => t._cleaning.type === '40 выезд' || t._cleaning.type === '40 выезд/заезд').length;
-    fortyNeeded.push(Math.max(0, base40 + (i < rem40 ? 1 : 0) - existing));
+    console.log(`  ${hkNames[i]}: ${hkHours[i]} ч → цель ~${Math.round(targetMins[i])} мин`);
   }
-  const extraForties = allForties.filter(t => !zone15Tasks.includes(t));
-  for (let i = 0; i < numHK; i++) {
-    for (let j = 0; j < fortyNeeded[i]; j++) {
-      if (extraForties.length === 0) break;
-      assignToHK(i, extraForties.shift());
+
+  // Сортируем горничных: от меньших часов к большим
+  const hkByHours = hkHours.map((h, i) => i).sort((a, b) => hkHours[a] - hkHours[b]);
+
+  // Выбор ближайшей задачи: приоритет — тот же этаж, потом расстояние
+  function pickClosest(available, assignedRooms) {
+    let best = 0, bestScore = Infinity;
+    for (let k = 0; k < available.length; k++) {
+      const aFloor = Math.floor(available[k].room / 100);
+      const sameFloor = assignedRooms.length
+        ? assignedRooms.some(r => Math.floor(r / 100) === aFloor) ? 0 : 1
+        : 0;
+      const dist = assignedRooms.length
+        ? Math.min(...assignedRooms.map(r => Math.abs(r - available[k].room)))
+        : 0;
+      const score = sameFloor * 10000 + dist;
+      if (score < bestScore) { bestScore = score; best = k; }
     }
-  }
-  while (extraForties.length > 0) {
-    assignToHK(hkMins.indexOf(Math.min(...hkMins)), extraForties.shift());
+    return best;
   }
 
-  const fortyDebt = [];
-  for (let i = 0; i < numHK; i++) {
-    const has40 = hkTasks[i].filter(t => t._cleaning.type === '40 выезд' || t._cleaning.type === '40 выезд/заезд').length;
-    fortyDebt.push(Math.max(0, base40 - has40));
+  // Подсчёт больших номеров у горничной (по типу уборки)
+  function countLarge(hkIdx, typeFilter) {
+    return hkTasks[hkIdx].filter(t =>
+      LARGE_ROOMS.has(t.room) && (!typeFilter || typeFilter === t._cleaning.type)
+    ).length;
   }
 
-  console.log(`Сороковок: ${totalForties} (${base40}×${numHK}${rem40 > 0 ? ' + ' + rem40 : ''})`);
+  // Попытка обмена больших номеров между горничными
+  function balanceLargeRooms(typeFilter, maxIter) {
+    for (let iter = 0; iter < (maxIter || 20); iter++) {
+      let maxIdx = -1, minIdx = -1;
+      let maxCnt = -1, minCnt = Infinity;
+      for (const i of hkByHours) {
+        const c = countLarge(i, typeFilter);
+        if (c > maxCnt) { maxCnt = c; maxIdx = i; }
+        if (c < minCnt) { minCnt = c; minIdx = i; }
+      }
+      if (maxIdx === -1 || minIdx === -1 || maxCnt - minCnt <= 1) break;
 
-  // Двадцатки и десятки
-  let twentyTenTasks = tasks.filter(t => t._cleaning.type === '20' || t._cleaning.type === '10').sort((a, b) => a.room - b.room);
-  const assignedRooms = new Set();
-  for (let i = 0; i < numHK; i++)
-    for (const t of hkTasks[i]) assignedRooms.add(t.room);
-  twentyTenTasks = twentyTenTasks.filter(t => !assignedRooms.has(t.room));
+      let swapped = false;
+      for (let ri = 0; ri < hkTasks[maxIdx].length && !swapped; ri++) {
+        const rTask = hkTasks[maxIdx][ri];
+        if (!LARGE_ROOMS.has(rTask.room)) continue;
+        if (typeFilter && rTask._cleaning.type !== typeFilter) continue;
 
-  // Компенсация
-  for (let i = 0; i < numHK; i++) {
-    for (let j = 0; j < fortyDebt[i] * 2; j++) {
-      let bestIdx = 0, bestDist = Infinity;
-      if (hkTasks[i].length > 0) {
-        const myRooms = hkTasks[i].map(t => t.room);
-        for (let k = 0; k < twentyTenTasks.length; k++) {
-          if (twentyTenTasks[k]._cleaning.type !== '20') continue;
-          const dist = Math.min(...myRooms.map(r => Math.abs(r - twentyTenTasks[k].room)));
-          if (dist < bestDist) { bestDist = dist; bestIdx = k; }
+        for (let pi = 0; pi < hkTasks[minIdx].length && !swapped; pi++) {
+          const pTask = hkTasks[minIdx][pi];
+          if (LARGE_ROOMS.has(pTask.room)) continue;
+          if (typeFilter && pTask._cleaning.type !== typeFilter) continue;
+          if (rTask._cleaning.minutes !== pTask._cleaning.minutes) continue;
+
+          // Меняем
+          hkTasks[maxIdx][ri] = pTask;
+          hkTasks[minIdx][pi] = rTask;
+          swapped = true;
         }
       }
-      if (twentyTenTasks.length > 0 && twentyTenTasks[bestIdx]._cleaning.type === '20')
-        assignToHK(i, twentyTenTasks.splice(bestIdx, 1)[0]);
+      if (!swapped) break;
     }
   }
 
-  // Остаток блоками
-  if (twentyTenTasks.length > 0) {
-    const targets = [];
-    for (let i = 0; i < numHK; i++) targets.push(Math.max(0, targetPerHK - hkMins[i]));
-    let ptr = 0;
-    for (let i = 0; i < numHK; i++) {
-      let blockMin = 0;
-      const isLast = (i === numHK - 1);
-      while (ptr < twentyTenTasks.length) {
-        const taskMin = twentyTenTasks[ptr]._cleaning.minutes || 0;
-        if (!isLast && blockMin >= targets[i]) break;
-        assignToHK(i, twentyTenTasks[ptr]);
-        blockMin += taskMin;
-        ptr++;
-      }
+  // ============================================================
+  // ФАЗА 1: 40-минутные уборки
+  // Делим поровну. Остаток — тем, кто работает БОЛЬШЕ.
+  // Короткий день получает base (без остатка).
+  // ============================================================
+  console.log('\n--- Фаза 1: 40-минутные уборки ---');
+
+  // Отделяем выезд/заезд от простых выездов
+  const vyezdZaezdTasks = allForties.filter(t => t._cleaning.type === '40 выезд/заезд')
+    .sort((a, b) => a.room - b.room);
+  const plainForties = allForties.filter(t => t._cleaning.type === '40 выезд')
+    .sort((a, b) => a.room - b.room);
+
+  // Сначала распределяем выезд/заезд: макс 2 на горничную
+  const vzPool = [...vyezdZaezdTasks];
+  for (let round = 0; round < 2 && vzPool.length > 0; round++) {
+    for (const hkIdx of hkByHours.slice().reverse()) {
+      // Обратный порядок: более загруженные первыми получают выезд/заезд
+      if (vzPool.length === 0) break;
+      if (hkVyzdyZaezd[hkIdx] >= 2) continue;
+      const best = pickClosest(vzPool, hkTasks[hkIdx].map(t => t.room));
+      assignToHK(hkIdx, vzPool.splice(best, 1)[0]);
     }
   }
-
-  // Микро-корректировка (5 итераций)
-  for (let iter = 0; iter < 5; iter++) {
-    let maxIdx = 0, minIdx = 0;
-    for (let i = 0; i < numHK; i++) {
-      if (hkMins[i] > hkMins[maxIdx]) maxIdx = i;
-      if (hkMins[i] < hkMins[minIdx]) minIdx = i;
-    }
-    const diff = hkMins[maxIdx] - hkMins[minIdx];
-    if (diff <= 10) break;
-
-    let bestSwap = null, bestRoomDist = Infinity;
-    for (let ri = 0; ri < hkTasks[maxIdx].length; ri++) {
-      const rTask = hkTasks[maxIdx][ri], rMin = rTask._cleaning.minutes || 0;
-      for (let pi = 0; pi < hkTasks[minIdx].length; pi++) {
-        const pTask = hkTasks[minIdx][pi], pMin = pTask._cleaning.minutes || 0;
-        const newDiff = Math.abs((hkMins[maxIdx] - rMin + pMin) - (hkMins[minIdx] + rMin - pMin));
-        if (newDiff < diff) {
-          const rIs40 = (rTask._cleaning.type === '40 выезд' || rTask._cleaning.type === '40 выезд/заезд');
-          const pIs40 = (pTask._cleaning.type === '40 выезд' || pTask._cleaning.type === '40 выезд/заезд');
-          if (rIs40 !== pIs40) continue;
-          const roomDist = Math.abs(rTask.room - pTask.room);
-          if (roomDist < bestRoomDist) { bestRoomDist = roomDist; bestSwap = { ri, pi, maxIdx, minIdx }; }
-        }
-      }
-    }
-
-    if (bestSwap && bestRoomDist < 50) {
-      const { ri, pi } = bestSwap;
-      const richTask = hkTasks[maxIdx][ri], poorTask = hkTasks[minIdx][pi];
-      hkTasks[maxIdx][ri] = poorTask; hkTasks[minIdx][pi] = richTask;
-      hkMins[maxIdx] = hkMins[maxIdx] - (richTask._cleaning.minutes||0) + (poorTask._cleaning.minutes||0);
-      hkMins[minIdx] = hkMins[minIdx] - (poorTask._cleaning.minutes||0) + (richTask._cleaning.minutes||0);
-    } else {
-      let bestMoveIdx = -1, bestDist = Infinity;
-      for (let ri = 0; ri < hkTasks[maxIdx].length; ri++) {
-        const t = hkTasks[maxIdx][ri], tMin = t._cleaning.minutes || 0;
-        if (tMin > diff) continue;
-        if (t._cleaning.type === '40 выезд' || t._cleaning.type === '40 выезд/заезд') continue;
-        const dist = Math.min(...hkTasks[minIdx].map(pt => Math.abs(t.room - pt.room)));
-        if (dist < bestDist) { bestDist = dist; bestMoveIdx = ri; }
-      }
-      if (bestMoveIdx !== -1 && bestDist < 50) {
-        const task = hkTasks[maxIdx].splice(bestMoveIdx, 1)[0];
-        hkTasks[minIdx].push(task);
-        hkMins[maxIdx] -= task._cleaning.minutes||0;
-        hkMins[minIdx] += task._cleaning.minutes||0;
-      } else break;
-    }
+  // Оставшиеся выезд/заезд — тем, у кого меньше 2
+  while (vzPool.length > 0) {
+    const hkIdx = hkByHours.reduce((best, i) =>
+      hkVyzdyZaezd[i] < hkVyzdyZaezd[best] ? i : best, hkByHours[0]);
+    const best = pickClosest(vzPool, hkTasks[hkIdx].map(t => t.room));
+    assignToHK(hkIdx, vzPool.splice(best, 1)[0]);
   }
 
-  // Лимит 2 выезд/заезд на горничную
+  // Считаем, сколько ещё 40-минутных нужно каждой горничной
+  const totalFortiesAssigned = allForties.length;
+  const base40 = Math.floor(totalFortiesAssigned / numHK);
+  const rem40 = totalFortiesAssigned % numHK;
+  const fortyTargets = new Array(numHK).fill(base40);
+  for (let i = 0; i < rem40; i++) {
+    // Остаток — тем, кто работает дольше
+    fortyTargets[hkByHours[numHK - 1 - i]]++;
+  }
+
+  // Распределяем остальные 40-минутные (простые выезды)
+  const plainPool = [...plainForties];
+  for (const hkIdx of hkByHours) {
+    const current40s = hkTasks[hkIdx].filter(t =>
+      t._cleaning.type === '40 выезд' || t._cleaning.type === '40 выезд/заезд'
+    ).length;
+    const needed = fortyTargets[hkIdx] - current40s;
+    for (let j = 0; j < needed && plainPool.length > 0; j++) {
+      const best = pickClosest(plainPool, hkTasks[hkIdx].map(t => t.room));
+      assignToHK(hkIdx, plainPool.splice(best, 1)[0]);
+    }
+  }
+  while (plainPool.length > 0) {
+    const hkIdx = hkByHours.reduce((best, i) => hkMins[i] < hkMins[best] ? i : best, hkByHours[0]);
+    const best = pickClosest(plainPool, hkTasks[hkIdx].map(t => t.room));
+    assignToHK(hkIdx, plainPool.splice(best, 1)[0]);
+  }
+
+  // Балансировка больших номеров среди 40-минутных уборок (только 40-минутные)
+  balanceLargeRooms(null, 20);
+
+  // Лимит 2 выезд/заезд на горничную (финальная проверка)
   for (let i = 0; i < numHK; i++) {
     let attempts = 0;
     while (hkVyzdyZaezd[i] > 2 && attempts < 10) {
       attempts++;
       const swapIdx = hkTasks[i].findIndex(t => t._cleaning.type === '40 выезд/заезд');
       if (swapIdx === -1) break;
-      let best = null;
+      // Ищем, кому отдать: у кого < 2 выезд/заезд
+      let bestJ = -1;
       for (let j = 0; j < numHK; j++) {
         if (j === i || hkVyzdyZaezd[j] >= 2) continue;
         const their40 = hkTasks[j].findIndex(t => t._cleaning.type === '40 выезд');
-        if (their40 !== -1) { best = { j, idx: their40 }; break; }
+        if (their40 !== -1) { bestJ = j; break; }
       }
-      if (best) {
-        const tmp = hkTasks[i][swapIdx]; hkTasks[i][swapIdx] = hkTasks[best.j][best.idx]; hkTasks[best.j][best.idx] = tmp;
-        hkVyzdyZaezd[i]--; hkVyzdyZaezd[best.j]++;
+      if (bestJ !== -1) {
+        const vzIdx = swapIdx;
+        const p40Idx = hkTasks[bestJ].findIndex(t => t._cleaning.type === '40 выезд');
+        const tmp = hkTasks[i][vzIdx];
+        hkTasks[i][vzIdx] = hkTasks[bestJ][p40Idx];
+        hkTasks[bestJ][p40Idx] = tmp;
+        hkVyzdyZaezd[i]--;
+        hkVyzdyZaezd[bestJ]++;
       } else break;
     }
   }
+
+  console.log(`Сороковки: ${fortyTargets.map((c, i) => `${hkNames[i]}: ${c}`).join(', ')}`);
+
+  // ============================================================
+  // ФАЗА 1.5: Балансировка 20+20=40 (только если не превышает часы)
+  // Если после 40-минутных у горничной дефицит ≥40 мин относительно
+  // её пропорционального таргета — добавляем 2×20 из пула.
+  // Короткий день (4ч) не получит лишнего сверх пропорции.
+  // ============================================================
+  console.log('\n--- Фаза 1.5: 20+20 балансировка ---');
+  const used20as40 = new Set();
+
+  for (const hkIdx of hkByHours) {
+    const current40Min = hkTasks[hkIdx]
+      .filter(t => t._cleaning.type === '40 выезд' || t._cleaning.type === '40 выезд/заезд')
+      .reduce((s, t) => s + (t._cleaning.minutes || 0), 0);
+    const deficit = targetMins[hkIdx] - current40Min;
+
+    if (deficit >= 40) {
+      const available20s = allTwenties.filter(t => !used20as40.has(t.room));
+      if (available20s.length >= 2) {
+        const pool = [...available20s];
+        const firstIdx = pickClosest(pool, hkTasks[hkIdx].map(t => t.room));
+        used20as40.add(pool[firstIdx].room);
+        assignToHK(hkIdx, pool[firstIdx]);
+        pool.splice(firstIdx, 1);
+        if (pool.length > 0) {
+          const secondIdx = pickClosest(pool, hkTasks[hkIdx].map(t => t.room));
+          used20as40.add(pool[secondIdx].room);
+          assignToHK(hkIdx, pool[secondIdx]);
+        }
+      }
+    }
+  }
+
+  console.log(`Использовано 20-минутных для баланса: ${used20as40.size}`);
+
+  // ============================================================
+  // ФАЗА 2: Оставшиеся 20-минутные уборки
+  // Делим поровну. Остаток — самой короткой.
+  // Балансируем большие номера.
+  // ============================================================
+  console.log('\n--- Фаза 2: 20-минутные уборки ---');
+  const remaining20s = allTwenties.filter(t => !used20as40.has(t.room));
+  const totalRemaining20s = remaining20s.length;
+
+  const base20 = Math.floor(totalRemaining20s / numHK);
+  const rem20 = totalRemaining20s % numHK;
+  const twentyTargets = new Array(numHK).fill(base20);
+  for (let i = 0; i < rem20; i++) {
+    // Остаток — тем, кто работает дольше (короткий день получает base)
+    twentyTargets[hkByHours[numHK - 1 - i]]++;
+  }
+
+  const pool20 = [...remaining20s];
+  for (const hkIdx of hkByHours) {
+    const needed = twentyTargets[hkIdx];
+    for (let j = 0; j < needed && pool20.length > 0; j++) {
+      const best = pickClosest(pool20, hkTasks[hkIdx].map(t => t.room));
+      assignToHK(hkIdx, pool20.splice(best, 1)[0]);
+    }
+  }
+  while (pool20.length > 0) {
+    const hkIdx = hkByHours.reduce((best, i) => hkMins[i] < hkMins[best] ? i : best, hkByHours[0]);
+    const best = pickClosest(pool20, hkTasks[hkIdx].map(t => t.room));
+    assignToHK(hkIdx, pool20.splice(best, 1)[0]);
+  }
+
+  // Балансировка больших номеров среди 20-минутных уборок
+  balanceLargeRooms('20', 20);
+
+  console.log(`Двадцатки: ${twentyTargets.map((c, i) => `${hkNames[i]}: ${c}`).join(', ')}`);
+
+  // ============================================================
+  // ФАЗА 3: 10-минутные уборки
+  // Сначала добиваем хвостики 10+10=20 (кто отстаёт от таргета),
+  // потом делим поровну.
+  // ============================================================
+  console.log('\n--- Фаза 3: 10-минутные уборки ---');
+
+  const pool10 = [...allTens];
+
+  // Для тех, кто сильно отстаёт от пропорционального таргета — 10+10=20
+  for (const hkIdx of hkByHours) {
+    if (pool10.length < 2) break;
+    const diff = targetMins[hkIdx] - hkMins[hkIdx];
+    if (diff >= 20) {
+      const first = pickClosest(pool10, hkTasks[hkIdx].map(t => t.room));
+      assignToHK(hkIdx, pool10.splice(first, 1)[0]);
+      if (pool10.length > 0) {
+        const second = pickClosest(pool10, hkTasks[hkIdx].map(t => t.room));
+        assignToHK(hkIdx, pool10.splice(second, 1)[0]);
+      }
+    }
+  }
+
+  // Оставшиеся десятки — делим поровну
+  const totalRemaining10s = pool10.length;
+  const base10 = Math.floor(totalRemaining10s / numHK);
+  const rem10 = totalRemaining10s % numHK;
+  const tenTargets = new Array(numHK).fill(base10);
+  for (let i = 0; i < rem10; i++) {
+    tenTargets[hkByHours[numHK - 1 - i]]++;
+  }
+
+  for (const hkIdx of hkByHours) {
+    const needed = tenTargets[hkIdx];
+    for (let j = 0; j < needed && pool10.length > 0; j++) {
+      const best = pickClosest(pool10, hkTasks[hkIdx].map(t => t.room));
+      assignToHK(hkIdx, pool10.splice(best, 1)[0]);
+    }
+  }
+  while (pool10.length > 0) {
+    const hkIdx = hkByHours.reduce((best, i) => hkMins[i] < hkMins[best] ? i : best, hkByHours[0]);
+    const best = pickClosest(pool10, hkTasks[hkIdx].map(t => t.room));
+    assignToHK(hkIdx, pool10.splice(best, 1)[0]);
+  }
+
+  console.log(`Десятки: ${tenTargets.map((c, i) => `${hkNames[i]}: ${c}`).join(', ')}`);
+
+  // Итоговый баланс по минутам
+  console.log('\n=== ИТОГ ПО МИНУТАМ ===');
+  for (let i = 0; i < numHK; i++) {
+    const fortyCount = hkTasks[i].filter(t => t._cleaning.type === '40 выезд' || t._cleaning.type === '40 выезд/заезд').length;
+    const twentyCount = hkTasks[i].filter(t => t._cleaning.type === '20').length;
+    const tenCount = hkTasks[i].filter(t => t._cleaning.type === '10').length;
+    const largeCount = hkTasks[i].filter(t => LARGE_ROOMS.has(t.room)).length;
+    const vzCount = hkVyzdyZaezd[i];
+    console.log(`  ${hkNames[i]}: ${hkMins[i]} мин (40: ${fortyCount}, 20: ${twentyCount}, 10: ${tenCount}, больших: ${largeCount}, выезд/заезд: ${vzCount})`);
+  }
+
+  // Общая балансировка больших номеров (ещё раз по всем типам)
+  balanceLargeRooms(null, 10);
 
   // Консоль
   for (let i = 0; i < numHK; i++) {
@@ -493,10 +745,10 @@ async function main() {
   const HK_COLORS = ['FFE74C3C','FF3498DB','FF2ECC71','FF9B59B6','FFF39C12','FF1ABC9C'];
   const typeToCol = { '10': 2, '40 выезд/заезд': 3, '40 выезд': 4, '20': 5 };
 
-  const roomInfo = {};
+  const roomAssign = {};
   for (let i = 0; i < numHK; i++)
     for (const t of hkTasks[i])
-      roomInfo[t.room] = { hkIdx: i, type: t._cleaning.type };
+      roomAssign[t.room] = { hkIdx: i, type: t._cleaning.type };
 
   // --- Лист 1: Уборки на сегодня ---
   const ws1 = wb.addWorksheet('Уборки на сегодня', { views: [{ state: 'frozen', ySplit: 3 }] });
@@ -532,8 +784,11 @@ async function main() {
   // Цвета в таблице
   for (let r = 4; r <= ws1.rowCount; r++) {
     const room = ws1.getCell(r, 1).value;
-    if (room && roomInfo[room]) {
-      const { hkIdx, type } = roomInfo[room];
+    if (room && LARGE_ROOMS.has(Number(room))) {
+      ws1.getCell(r, 1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: LARGE_ROOM_COLOR } };
+    }
+    if (room && roomAssign[room]) {
+      const { hkIdx, type } = roomAssign[room];
       const col = typeToCol[type];
       if (col) {
         ws1.getCell(r, col).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: HK_COLORS[hkIdx % HK_COLORS.length] } };
@@ -592,24 +847,13 @@ async function main() {
   hK.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2980B9' } };
   hK.font = { bold: true, color: { argb: 'FFFFFFFF' } };
 
-  const arrivalMap = {};
-  for (const entry of sections.arrivals) {
-    if (!arrivalMap[entry.room]) arrivalMap[entry.room] = { room: entry.room, guests: [], nights: 0 };
-    if (entry.guest && !arrivalMap[entry.room].guests.includes(entry.guest)) arrivalMap[entry.room].guests.push(entry.guest);
-    if (entry.checkin) arrivalMap[entry.room]._checkin = `${String(entry.checkin.getDate()).padStart(2,'0')}.${String(entry.checkin.getMonth()+1).padStart(2,'0')}`;
-    if (entry.checkout) arrivalMap[entry.room]._checkout = `${String(entry.checkout.getDate()).padStart(2,'0')}.${String(entry.checkout.getMonth()+1).padStart(2,'0')}`;
-    if (entry.checkin && entry.checkout) {
-      const nights = Math.round((entry.checkout - entry.checkin) / (1000*60*60*24));
-      if (nights > 0) arrivalMap[entry.room].nights = nights;
-    }
-  }
-
   let totalGuests = 0;
-  for (const entry of Object.values(arrivalMap).sort((a,b) => a.room - b.room)) {
+  for (const entry of arrivals.sort((a,b) => a.room - b.room)) {
     const gc = getGuestCount(entry.room);
-    const names = entry.guests.join(', ');
-    wsK.addRow([entry.room, names, gc, entry.nights || '', entry._checkin || '', entry._checkout || '']);
-    if (gc) totalGuests += String(gc).split('+').reduce((s, p) => s + (parseInt(p) || 0), 0);
+    const checkinStr = entry.checkin ? `${String(entry.checkin.getDate()).padStart(2,'0')}.${String(entry.checkin.getMonth()+1).padStart(2,'0')}` : '';
+    const checkoutStr = entry.checkout ? `${String(entry.checkout.getDate()).padStart(2,'0')}.${String(entry.checkout.getMonth()+1).padStart(2,'0')}` : '';
+    wsK.addRow([entry.room, entry.guest, gc, entry.nights || '', checkinStr, checkoutStr]);
+    if (gc) totalGuests += parseInt(String(gc).split('+')[0]) || 0;
   }
   wsK.addRow([]);
   wsK.addRow([`Итого гостей: ${totalGuests}`]);
@@ -643,6 +887,9 @@ async function main() {
         t._comment || '', t._guestCount || '',
       ]);
       row.alignment = { horizontal: 'center', vertical: 'middle' };
+      if (LARGE_ROOMS.has(t.room)) {
+        wsHk.getCell(row.number, 1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: LARGE_ROOM_COLOR } };
+      }
       if (hkRoomSet.has(t.room)) {
         const col = typeToCol[type];
         if (col) {
@@ -659,7 +906,7 @@ async function main() {
   // Архив
   const archiveDir = path.join(DATA_DIR, 'старые');
   if (!fs.existsSync(archiveDir)) fs.mkdirSync(archiveDir, { recursive: true });
-  for (const f of [ARRIVALS_FILE, DEPARTURES_FILE, OCCUPIED_FILE])
+  for (const f of [ARRIVALS_FILE, DEPARTURES_FILE, STAYING_FILE].filter(f => f && fs.existsSync(f)))
     fs.renameSync(f, path.join(archiveDir, path.basename(f)));
   console.log(`📦 Исходные файлы перемещены в "старые"`);
 }

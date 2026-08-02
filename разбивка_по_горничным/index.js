@@ -13,6 +13,7 @@ function findFiles() {
   const dirs = [
     path.join(__dirname, '..', 'отчёты_горничным_с_сортировкой', 'готовые_отчёты'),
     path.join(__dirname, '..', 'отчёты_горничным_без_сортировки', 'готовые_отчёты'),
+    path.join(__dirname, '..', 'отчёты_горничным_с_travelline', 'готовые_отчёты'),
     __dirname,
   ];
   for (const dir of dirs) {
