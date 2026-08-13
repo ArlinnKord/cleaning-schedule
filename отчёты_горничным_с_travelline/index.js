@@ -33,18 +33,21 @@ function findReport(prefixes) {
 
 // Основной источник: русскоязычные отчёты «Заезды», «Выезды», «Проживания»
 // (fallback — англоязычные ArrivalsReport / DeparturesReport / OccupiedRoomTypes)
+// Плюс отчёт Housekeeping — это «шахматка»: по нему определяются типы уборок.
 const ARRIVALS_FILE = findReport(['Заезды', 'ArrivalsReport']);
 const DEPARTURES_FILE = findReport(['Выезды', 'DeparturesReport']);
 const STAYING_FILE = findReport(['Проживания', 'OccupiedRoomTypes']);
+const HOUSEKEEPING_FILE = findReport(['Housekeeping']);
 
-if (!ARRIVALS_FILE || !DEPARTURES_FILE || !STAYING_FILE) {
-  console.error('❌ Не найдены отчёты Заезды/Выезды/Проживания в папке отчёты_из_travelline');
+if (!ARRIVALS_FILE || !DEPARTURES_FILE || !STAYING_FILE || !HOUSEKEEPING_FILE) {
+  console.error('❌ Не найдены отчёты Заезды/Выезды/Проживания/Housekeeping в папке отчёты_из_travelline');
   process.exit(1);
 }
 
 console.log(`📥 Заезды: ${path.basename(ARRIVALS_FILE)}`);
 console.log(`📥 Выезды: ${path.basename(DEPARTURES_FILE)}`);
 console.log(`📥 Проживания: ${path.basename(STAYING_FILE)}`);
+console.log(`📥 Шахматка (Housekeeping): ${path.basename(HOUSEKEEPING_FILE)}`);
 
 // Дата из имени файла заездов (Заезды_01.08.2026_01.08.2026.xlsx)
 const dateMatch = path.basename(ARRIVALS_FILE).match(/(\d{2})\.(\d{2})\.(\d{4})/);
@@ -135,9 +138,15 @@ function parseTLReport(filePath, todayDate, section) {
     if (section === 'arrivals' && !checkinStr && checkinCol !== -1) checkinStr = String(row[checkinCol] || '');
     if (section === 'departures' && !checkoutStr && checkoutCol !== -1) checkoutStr = String(row[checkoutCol] || '');
 
-    // Фильтр: для заездов/выездов только сегодняшние
+    // Фильтр: заезды — только сегодняшние.
+    // Выезды: отчёт выгружен на сегодня, но при «Задержке» в колонке
+    // «Время выезда» остаётся ПЛАНОВАЯ дата (вчерашняя). Поэтому отбрасываем
+    // только выезды, запланированные строго ПОСЛЕ сегодняшнего дня.
     if (section === 'arrivals' && !checkinStr.startsWith(todayStr)) continue;
-    if (section === 'departures' && !checkoutStr.startsWith(todayStr)) continue;
+    if (section === 'departures') {
+      const co = parseTLDate(checkoutStr);
+      if (co.date && co.date > todayDate) continue;
+    }
 
     if (!rooms[room]) {
       rooms[room] = {
@@ -192,17 +201,92 @@ function parseTLReport(filePath, todayDate, section) {
   });
 }
 
+/**
+ * Отчёт Housekeeping — «шахматка». По каждому номеру: занятость и плановые
+ * даты «Номер будет освобожден» (выезд) / «Номер будет заселен» (заезд).
+ * Эти даты — плановые, поэтому шахматка НЕ устаревает так быстро, как отчёт
+ * «Выезды» (который показывает только уже подтверждённые события).
+ */
+function parseHousekeeping(filePath) {
+  const wb = XLSX.readFile(filePath);
+  const ws = wb.Sheets['Report'] || wb.Sheets[wb.SheetNames[0]];
+  const data = XLSX.utils.sheet_to_json(ws, { defval: '', header: 1 });
+  if (data.length < 2) return null;
+  const h = data[0];
+  const roomCol = h.indexOf('Номер');
+  const occCol = h.indexOf('Занятость');
+  const releaseCol = h.indexOf('Номер будет освобожден');
+  const occupyCol = h.indexOf('Номер будет заселен');
+  if (roomCol === -1 || occCol === -1 || releaseCol === -1 || occupyCol === -1) return null;
+
+  const map = new Map();
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const room = parseInt(row[roomCol]);
+    if (isNaN(room)) continue;
+    const release = parseTLDate(String(row[releaseCol] || ''));
+    const occupy = parseTLDate(String(row[occupyCol] || ''));
+    map.set(room, {
+      room,
+      occupied: String(row[occCol] || '').startsWith('Занят'),
+      releaseDate: release.date, releaseHour: release.hour, releaseMinute: release.minute,
+      occupyDate: occupy.date, occupyHour: occupy.hour, occupyMinute: occupy.minute,
+    });
+  }
+  return map;
+}
+
 // ==============================
 // СБОРКА
 // ==============================
 
-const arrivals = parseTLReport(ARRIVALS_FILE, REPORT_DATE, 'arrivals');
-const departures = parseTLReport(DEPARTURES_FILE, REPORT_DATE, 'departures');
-const allStaying = parseTLReport(STAYING_FILE, REPORT_DATE, 'staying');
+// Детали (комментарии, гости, кол-во, ночи) из отчётов Заезды/Выезды/Проживания
+const arrDetail = parseTLReport(ARRIVALS_FILE, REPORT_DATE, 'arrivals');
+const depDetail = parseTLReport(DEPARTURES_FILE, REPORT_DATE, 'departures');
+const stayDetail = parseTLReport(STAYING_FILE, REPORT_DATE, 'staying');
 
-// Staying = те кто проживает И не выезжает сегодня
-const depRoomSet = new Set(departures.map(d => d.room));
-const staying = allStaying.filter(s => !depRoomSet.has(s.room));
+// Главный источник типов уборок — шахматка (Housekeeping).
+// Отчёт «Выезды» может не успеть обновиться к запуску (устаревший снимок),
+// а плановые «освобожден/заселен» из шахматки видны заранее.
+const hkMap = parseHousekeeping(HOUSEKEEPING_FILE);
+if (!hkMap || hkMap.size === 0) {
+  console.error('❌ Не удалось прочитать шахматку (Housekeeping). Проверьте файл.');
+  process.exit(1);
+}
+const isSameDay = d => d && d.getTime() === REPORT_DATE.getTime();
+
+const hkDepRooms = [];
+const hkArrRooms = [];
+const hkStayRooms = [];
+for (const info of hkMap.values()) {
+  if (isSameDay(info.releaseDate)) hkDepRooms.push(info.room);
+  if (isSameDay(info.occupyDate)) hkArrRooms.push(info.room);
+  // Проживание = занят сегодня и не выезжает сегодня (номер, освобождённый
+  // раньше даты отчёта, на дату отчёта уже пустой — уборка не нужна)
+  const releasedBefore = info.releaseDate && info.releaseDate < REPORT_DATE;
+  if (info.occupied && !isSameDay(info.releaseDate) && !releasedBefore) hkStayRooms.push(info.room);
+}
+
+const depRoomSet = new Set(hkDepRooms);
+const arrivals = hkArrRooms.map(room => arrDetail.find(x => x.room === room) || {
+  room, guest: '', guestCount: 0, comment: '', notes: '', nights: 0,
+  checkin: null, checkout: null, checkoutHour: null, checkoutMinute: null,
+});
+const departures = hkDepRooms.map(room => {
+  const d = depDetail.find(x => x.room === room);
+  if (d) return d;
+  const info = hkMap.get(room);
+  return {
+    room, guest: '', guestCount: 0, comment: '', notes: '', nights: 0,
+    checkin: null, checkout: info ? info.releaseDate : null,
+    checkoutHour: info ? info.releaseHour : null,
+    checkoutMinute: info ? info.releaseMinute : null,
+  };
+});
+const staying = hkStayRooms.map(room => stayDetail.find(x => x.room === room) || {
+  room, guest: '', guestCount: 0, comment: '', notes: '', nights: 0,
+  checkin: null, checkout: null, checkoutHour: null, checkoutMinute: null,
+});
 
 const arrivalRooms = [...new Set(arrivals.map(r => r.room))];
 const depRoomsList = [...new Set(departures.map(r => r.room))];
@@ -398,6 +482,25 @@ async function main() {
       t._guestCount ? `| кол-во: ${t._guestCount}` : ''
     );
   }
+
+  // Сверка с шахматкой: отчёт «Выезды» — это снимок на момент скачивания,
+  // он может устареть (гости выехали раньше/позже). Поэтому спрашиваем
+  // про номера, где по шахматке выезд, а в отчёте их нет.
+  const extraDepRaw = await ask('\nНомера на ВЫЕЗД по шахматке, которых нет в отчёте (через запятую, пусто — пропустить): ', '');
+  const extraDepRooms = extraDepRaw.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+  let extraDepCount = 0;
+  for (const room of extraDepRooms) {
+    const t = tasks.find(x => x.room === room);
+    if (!t) continue;
+    if (departures.some(r => r.room === room)) continue; // уже учтён как выезд
+    const isArr = arrivals.some(r => r.room === room);
+    t._cleaning = { type: isArr ? '40 выезд/заезд' : '40 выезд', minutes: 40 };
+    t._comment = makeComment(room, t._cleaning);
+    t._guestCount = (t._cleaning.type === '40 выезд/заезд') ? getGuestCount(room) : '';
+    console.log(`  ➕ ${room} → ${t._cleaning.type}`);
+    extraDepCount++;
+  }
+  if (extraDepCount === 0) console.log('  (доп. выездов не введено)');
 
   const numHK = parseInt(await ask('Сколько горничных? (по умолчанию 3): ')) || 3;
   const hkNames = [];
@@ -906,7 +1009,7 @@ async function main() {
   // Архив
   const archiveDir = path.join(DATA_DIR, 'старые');
   if (!fs.existsSync(archiveDir)) fs.mkdirSync(archiveDir, { recursive: true });
-  for (const f of [ARRIVALS_FILE, DEPARTURES_FILE, STAYING_FILE].filter(f => f && fs.existsSync(f)))
+  for (const f of [ARRIVALS_FILE, DEPARTURES_FILE, STAYING_FILE, HOUSEKEEPING_FILE].filter(f => f && fs.existsSync(f)))
     fs.renameSync(f, path.join(archiveDir, path.basename(f)));
   console.log(`📦 Исходные файлы перемещены в "старые"`);
 }
